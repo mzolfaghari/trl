@@ -27,20 +27,32 @@
 set -euo pipefail
 
 # ── Edit these to match your environment ─────────────────────────────────────
-PROJECT_DIR=${PROJECT_DIR:-$HOME/trl}
+PROJECT_DIR=${PROJECT_DIR:-$HOME/projects/trl}
 DATA_DIR=${DATA_DIR:-$PROJECT_DIR/data/stage2}
 STAGE1_CKPT=${STAGE1_CKPT:-$PROJECT_DIR/checkpoints/stage1}
 OUT_DIR=${OUT_DIR:-$PROJECT_DIR/checkpoints/stage2_smoke}
 HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}
 TEACHER_MODEL=${TEACHER_MODEL:-Efficient-Large-Model/VILA-M3-7B}
 TEACHER_PORT=${TEACHER_PORT:-8000}
-# Activation: see stage1_smoke.sbatch for examples (conda / venv / module).
+CONDA_ENV=${CONDA_ENV:-vlm}
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Activate the conda env that has torch + transformers + trl[dev] + vllm
+#    installed. Auto-detects miniconda/anaconda in the usual locations.
+#    Override CONDA_ENV on the sbatch line for a different env name.
+for _conda_root in "$HOME/miniconda3" "$HOME/anaconda3" "/opt/conda" "/opt/miniconda3" "/opt/anaconda3"; do
+  if [ -f "$_conda_root/etc/profile.d/conda.sh" ]; then
+    source "$_conda_root/etc/profile.d/conda.sh"
+    break
+  fi
+done
+conda activate "$CONDA_ENV"
 
 cd "$PROJECT_DIR"
 export HF_HOME
 
-echo "[stage2_smoke] node=$(hostname)"
+echo "[stage2_smoke] node=$(hostname) conda_env=$CONDA_DEFAULT_ENV"
+python -c "import torch, trl; print(f'  torch={torch.__version__}  cuda={torch.cuda.is_available()}  trl={trl.__file__}')"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
 # ── 1. Launch VILA-M3 teacher on GPU 1 (background) ─────────────────────────
