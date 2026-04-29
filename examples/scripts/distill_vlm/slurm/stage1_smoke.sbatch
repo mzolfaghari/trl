@@ -10,8 +10,7 @@
 #       sbatch examples/scripts/distill_vlm/slurm/stage1_smoke.sbatch
 # ──────────────────────────────────────────────────────────────────────────────
 #SBATCH --job-name=trl_distill_vlm_stage1_smoke
-#SBATCH --account=CHANGE_ME
-#SBATCH --partition=CHANGE_ME
+#SBATCH --partition=main
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
