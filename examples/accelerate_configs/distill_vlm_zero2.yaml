@@ -1,0 +1,35 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Why this file exists:
+#   Single-node Accelerate / DeepSpeed Zero-2 launch config used by the VLM
+#   knowledge-distillation pipeline (`examples/scripts/distill_vlm/train_stage{1,2}.py`).
+#   Domain-agnostic — the included example is medical, but other domains
+#   (legal, scientific, …) only need to swap the data builders.
+#
+#   Defaults to `num_processes: 1` so a single-GPU smoke test "just works"
+#   without specifying a count. For multi-GPU runs, override on the command
+#   line, e.g.:
+#
+#       accelerate launch --num_processes 4 \
+#         --config_file examples/accelerate_configs/distill_vlm_zero2.yaml ...
+# ──────────────────────────────────────────────────────────────────────────────
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  deepspeed_multinode_launcher: standard
+  offload_optimizer_device: none
+  offload_param_device: none
+  zero3_init_flag: false
+  zero_stage: 2
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
