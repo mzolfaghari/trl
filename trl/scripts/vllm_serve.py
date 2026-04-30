@@ -667,6 +667,11 @@ def main(script_args: ScriptArguments):
         top_logprobs: int = 100
         temperature: float = 1.0
         response_format: str = "json"  # "json" (legacy) or "binary" (base64 numpy arrays)
+        # Optional per-sample image inputs for multimodal teachers. Mirrors the `images` field on
+        # `GenerateRequest`: each element is a list of base64-encoded PNG bytes for the corresponding
+        # sequence, or `None` when that sample is text-only. When omitted the server scores the
+        # sequences as text-only, preserving backwards compatibility with text-distillation callers.
+        images: list[list[str] | None] | None = None
 
     class SequenceLogprobsResponse(BaseModel):
         logprobs: list[list[list[float | None]]] | None = None
@@ -945,7 +950,26 @@ def main(script_args: ScriptArguments):
                         f"Truncate sequences or increase --max-model-len."
                     )
 
-        prompts = [{"prompt_token_ids": seq} for seq in request.sequences]
+        # Decode optional per-sample images and align them with sequences. When no images are
+        # provided the request is treated as text-only and we skip the multimodal payload entirely
+        # — `prompt_token_ids` then matches what the text-only path produced before this change.
+        images_per_sample: list[list[str] | None]
+        if request.images is None:
+            images_per_sample = [None] * len(request.sequences)
+        else:
+            if len(request.images) != len(request.sequences):
+                raise ValueError(
+                    f"images has length {len(request.images)} but sequences has length {len(request.sequences)}; "
+                    "they must match (use `None` for text-only samples within a mixed batch)."
+                )
+            images_per_sample = request.images
+
+        prompts = []
+        for seq, image_list in zip(request.sequences, images_per_sample, strict=True):
+            row = {"prompt_token_ids": seq}
+            if image_list is not None:
+                row["multi_modal_data"] = {"image": [Image.open(BytesIO(base64.b64decode(img))) for img in image_list]}
+            prompts.append(row)
 
         # Submit to the batching queue and await result
         loop = asyncio.get_running_loop()

@@ -352,9 +352,7 @@ class _DistillationCollator:
         # example in `examples/scripts/distill_vlm/` is the reference user). The collator simply
         # forwards the per-sample scalar weight to the trainer's loss path.
         if "class_weight" in examples[0]:
-            batch["class_weight"] = torch.tensor(
-                [float(ex["class_weight"]) for ex in examples], dtype=torch.float32
-            )
+            batch["class_weight"] = torch.tensor([float(ex["class_weight"]) for ex in examples], dtype=torch.float32)
 
         return batch
 
@@ -551,7 +549,7 @@ class DistillationTrainer(_BaseTrainer):
             if getattr(teacher_processing_class, "pad_token", None) is None:
                 teacher_processing_class.pad_token = teacher_processing_class.eos_token
             self._local_teacher_tokenizer_matches_student = self._local_teacher_tokenizers_match(
-                processing_class, teacher_processing_class
+                tokenizer, teacher_processing_class
             )
             if not self._local_teacher_tokenizer_matches_student:
                 warnings.warn(
@@ -593,6 +591,13 @@ class DistillationTrainer(_BaseTrainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
+
+        # --- qvac addition: keep an explicit text tokenizer separate from `processing_class` ---
+        # When the user passes a multimodal `ProcessorMixin` as `processing_class` (VLM workflow),
+        # tokenizer-only attributes (`pad_token_id`, `decode`, ...) live on `processor.tokenizer`
+        # rather than on the processor itself. Storing it here lets every downstream call site use
+        # `self.tokenizer.<attr>` regardless of whether the input was a tokenizer or a processor.
+        self.tokenizer = tokenizer
 
         # ── Prepare teacher model (after super().__init__ so accelerator is ready) ──
         if teacher_model is not None:
@@ -645,7 +650,7 @@ class DistillationTrainer(_BaseTrainer):
             "top_p": args.top_p,
             "do_sample": True,
             "top_k": args.top_k,
-            "pad_token_id": self.processing_class.pad_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
         }
         self.generation_config = GenerationConfig(**generation_kwargs)
         self.generation_kwargs = generation_kwargs
@@ -732,7 +737,7 @@ class DistillationTrainer(_BaseTrainer):
     def _get_completion_lengths(self, generated_tokens: torch.Tensor, prompt_width: int) -> torch.Tensor:
         """Infer per-sample completion lengths from generated tokens."""
         completion_tokens = generated_tokens[:, prompt_width:]
-        pad_token_id = self.processing_class.pad_token_id
+        pad_token_id = self.tokenizer.pad_token_id
         eos_token_id = self.generation_config.eos_token_id
         if eos_token_id is None:
             eos_token_ids = set()
@@ -891,7 +896,7 @@ class DistillationTrainer(_BaseTrainer):
         # receives only real prompt token IDs (like GRPO trainer).
         local_prompts = []
         local_slice_indices = []
-        pad_token_id = self.processing_class.pad_token_id
+        pad_token_id = self.tokenizer.pad_token_id
         for slice_idx in on_policy_indices:
             prompt_mask = slices[slice_idx].get("prompt_attention_mask")
             for i, prompt in enumerate(slices[slice_idx]["prompts"]):
@@ -939,7 +944,7 @@ class DistillationTrainer(_BaseTrainer):
                 generated_tokens = generated_outputs.sequences
                 batch_size = generated_tokens.size(0)
                 device = generated_tokens.device
-                pad_token_id = self.processing_class.pad_token_id
+                pad_token_id = self.tokenizer.pad_token_id
                 prompt_width = slice_inputs["prompts"].shape[1]
                 prompt_mask = slice_inputs.get("prompt_attention_mask")
                 if prompt_mask is not None:
@@ -960,13 +965,11 @@ class DistillationTrainer(_BaseTrainer):
                         prompt_tokens = prompt_tokens[prompt_mask[idx].bool()]
                     elif pad_token_id is not None:
                         prompt_tokens = prompt_tokens[prompt_tokens != pad_token_id]
-                    prompt_texts.append(
-                        self.processing_class.decode(prompt_tokens.tolist(), skip_special_tokens=False)
-                    )
+                    prompt_texts.append(self.tokenizer.decode(prompt_tokens.tolist(), skip_special_tokens=False))
                     length = prompt_width
                     completion_length = int(completion_lengths[idx].item())
                     completion_texts.append(
-                        self.processing_class.decode(
+                        self.tokenizer.decode(
                             generated_tokens[idx, length : length + completion_length].tolist(),
                             skip_special_tokens=False,
                         )
@@ -994,7 +997,7 @@ class DistillationTrainer(_BaseTrainer):
         GRPOTrainer.
         """
         device = self.accelerator.device
-        pad_token_id = self.processing_class.pad_token_id if self.processing_class.pad_token_id is not None else 0
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         max_completion_length = self.generation_config.max_new_tokens
 
         # Group completions and prompt token IDs by slice
@@ -1319,6 +1322,12 @@ class DistillationTrainer(_BaseTrainer):
             labels=inputs.get("labels"),
         )
 
+        # When the trainer is fed by a multimodal collator, the batch carries the raw PIL images
+        # under `raw_images`. Forward them so the teacher can resolve the image-token slots in
+        # `sequences`. For text-only batches the key is absent and we send a text-only request,
+        # which keeps the wire format byte-identical to the pre-VLM behaviour.
+        request_images = inputs.get("raw_images")
+
         # The pure forward server path can use the requested teacher top-k support.
         # When beta > 0, config validation restricts the server-backed path to top-1.
         requested_top_k = self.loss_top_k
@@ -1327,6 +1336,7 @@ class DistillationTrainer(_BaseTrainer):
             prompt_lengths=prompt_lengths,
             top_logprobs=requested_top_k,
             temperature=self.temperature,
+            images=request_images,
         )
         K = requested_top_k
 
@@ -1488,9 +1498,7 @@ class DistillationTrainer(_BaseTrainer):
         try:
             layer = self.model.model.vision_model.encoder.layers[-1]
             layer.register_forward_hook(
-                lambda m, i, o: self._s_feat.__setitem__(
-                    0, (o[0] if isinstance(o, tuple) else o).detach()
-                )
+                lambda m, i, o: self._s_feat.__setitem__(0, (o[0] if isinstance(o, tuple) else o).detach())
             )
         except AttributeError as e:
             warnings.warn(f"Could not register student RDist hook: {e}")
@@ -1499,9 +1507,7 @@ class DistillationTrainer(_BaseTrainer):
             try:
                 layer = self.teacher_model.model.vision_model.encoder.layers[-1]
                 layer.register_forward_hook(
-                    lambda m, i, o: self._t_feat.__setitem__(
-                        0, (o[0] if isinstance(o, tuple) else o)
-                    )
+                    lambda m, i, o: self._t_feat.__setitem__(0, (o[0] if isinstance(o, tuple) else o))
                 )
             except AttributeError as e:
                 warnings.warn(
@@ -1606,11 +1612,7 @@ class DistillationTrainer(_BaseTrainer):
         # matrices between the student and teacher's last vision encoder layer. Hooks populate
         # `_s_feat`/`_t_feat` during the forward pass (see `_register_rdist_hooks`).
         rdist_val = torch.tensor(0.0, device=loss.device)
-        if (
-            self.args.use_rdist
-            and self._s_feat[0] is not None
-            and self._t_feat[0] is not None
-        ):
+        if self.args.use_rdist and self._s_feat[0] is not None and self._t_feat[0] is not None:
             s = F.normalize(self._s_feat[0].float(), dim=-1)
             t = F.normalize(self._t_feat[0].float(), dim=-1)
             s_sim = torch.bmm(s, s.transpose(1, 2))
@@ -1628,11 +1630,7 @@ class DistillationTrainer(_BaseTrainer):
                 labels.reshape(-1),
                 ignore_index=-100,
             )
-            loss = (
-                self.args.alpha * sft_loss
-                + self.args.beta_kl * kl_loss
-                + self.args.beta_rdist * rdist_val
-            )
+            loss = self.args.alpha * sft_loss + self.args.beta_kl * kl_loss + self.args.beta_rdist * rdist_val
 
             mode = "train" if self.model.training else "eval"
             self._metrics[mode]["loss/sft"].append(float(sft_loss.detach()))

@@ -529,6 +529,7 @@ class VLLMClient:
         prompt_lengths: list[int],
         top_logprobs: int = 100,
         temperature: float = 1.0,
+        images: list | None = None,
         use_binary: bool = True,
         chunk_size: int = 0,
         max_concurrent_requests: int = 4,
@@ -540,8 +541,13 @@ class VLLMClient:
         completion region only. This is used for knowledge distillation where the teacher model evaluates existing
         sequences rather than generating new ones.
 
+        For multimodal teachers, pass per-sample image lists in `images` so the teacher can resolve the multimodal
+        placeholder tokens embedded in `sequences`. The shape and semantics mirror `VLLMClient.generate`'s `images`
+        argument.
+
         When `chunk_size > 0`, splits the batch into chunks and dispatches them concurrently via a thread pool, keeping
-        the server's data-parallel workers busy.
+        the server's data-parallel workers busy. The `images` list (when provided) is split alongside `sequences` so
+        each sample stays paired with its images.
 
         When `use_binary=True`, uses base64-encoded numpy arrays for fast serialization instead of nested JSON lists.
 
@@ -554,6 +560,10 @@ class VLLMClient:
                 Number of top logprobs to return per token position.
             temperature (`float`, *optional*, defaults to `1.0`):
                 Temperature used when scoring the teacher distribution.
+            images (`list[list[PIL.Image] or None]`, *optional*):
+                Per-sample image inputs for multimodal teachers. Each element is a list of PIL images for the
+                corresponding sequence, or `None` when that sample is text-only. Must have the same length as
+                `sequences` when provided. Leave as `None` for text-only distillation.
             use_binary (`bool`, *optional*, defaults to `True`):
                 Use binary (base64 numpy) response format for faster serialization.
             chunk_size (`int`, *optional*, defaults to `0`):
@@ -575,6 +585,19 @@ class VLLMClient:
         if temperature <= 0:
             raise ValueError(f"temperature must be positive, got {temperature}")
 
+        # Convert PIL images to base64 strings. Each element is a list of images for the corresponding sequence,
+        # or None if no images for that sequence. Mirrors the encoding done in `VLLMClient.generate`.
+        encoded_images: list[list[str] | None] | None = None
+        if images is not None:
+            if len(images) != len(sequences):
+                raise ValueError(
+                    f"`images` has length {len(images)} but `sequences` has length {len(sequences)}; "
+                    "they must match (use `None` for text-only samples within a mixed batch)."
+                )
+            encoded_images = [
+                [pil_to_base64(img) for img in img_list] if img_list is not None else None for img_list in images
+            ]
+
         url = f"{self.base_url}/get_sequence_logprobs/"
         response_format = "binary" if use_binary else "json"
 
@@ -583,28 +606,30 @@ class VLLMClient:
             n = len(sequences)
             chunks = []
             for i in range(0, n, chunk_size):
-                chunks.append((sequences[i : i + chunk_size], prompt_lengths[i : i + chunk_size]))
+                chunk_images = encoded_images[i : i + chunk_size] if encoded_images is not None else None
+                chunks.append((sequences[i : i + chunk_size], prompt_lengths[i : i + chunk_size], chunk_images))
 
             responses = [None] * len(chunks)
 
-            def _send_chunk(idx, seqs, plens):
-                resp = self.session.post(
-                    url,
-                    json={
-                        "sequences": seqs,
-                        "prompt_lengths": plens,
-                        "top_logprobs": top_logprobs,
-                        "temperature": temperature,
-                        "response_format": response_format,
-                    },
-                )
+            def _send_chunk(idx, seqs, plens, imgs):
+                payload = {
+                    "sequences": seqs,
+                    "prompt_lengths": plens,
+                    "top_logprobs": top_logprobs,
+                    "temperature": temperature,
+                    "response_format": response_format,
+                }
+                if imgs is not None:
+                    payload["images"] = imgs
+                resp = self.session.post(url, json=payload)
                 if resp.status_code != 200:
                     raise Exception(f"Request failed: {resp.status_code}, {resp.text}")
                 return idx, resp.json()
 
             with ThreadPoolExecutor(max_workers=min(max_concurrent_requests, len(chunks))) as executor:
                 futures = {
-                    executor.submit(_send_chunk, idx, seqs, plens): idx for idx, (seqs, plens) in enumerate(chunks)
+                    executor.submit(_send_chunk, idx, seqs, plens, imgs): idx
+                    for idx, (seqs, plens, imgs) in enumerate(chunks)
                 }
                 for future in as_completed(futures):
                     idx, result = future.result()
@@ -622,16 +647,16 @@ class VLLMClient:
                 return {"logprobs": all_logprobs, "logprob_token_ids": all_token_ids}
         else:
             # Single request
-            response = self.session.post(
-                url,
-                json={
-                    "sequences": sequences,
-                    "prompt_lengths": prompt_lengths,
-                    "top_logprobs": top_logprobs,
-                    "temperature": temperature,
-                    "response_format": response_format,
-                },
-            )
+            payload = {
+                "sequences": sequences,
+                "prompt_lengths": prompt_lengths,
+                "top_logprobs": top_logprobs,
+                "temperature": temperature,
+                "response_format": response_format,
+            }
+            if encoded_images is not None:
+                payload["images"] = encoded_images
+            response = self.session.post(url, json=payload)
             if response.status_code != 200:
                 raise Exception(f"Request failed: {response.status_code}, {response.text}")
 

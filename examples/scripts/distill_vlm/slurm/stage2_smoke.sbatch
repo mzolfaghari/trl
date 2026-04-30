@@ -3,8 +3,10 @@
 # Why this file exists:
 #   SLURM batch script for the Stage 2 VLM-distillation smoke test. Runs
 #   `train_stage2.py --smoke_test` (50 samples, 2 optimizer steps) and starts
-#   the teacher (VILA-M3 in the medical example) on a co-located GPU on the
-#   same node.
+#   the teacher (a public VLM, default `SmolVLM2-2.2B-Instruct`; override
+#   `TEACHER_MODEL` to swap, e.g. `Qwen/Qwen2.5-VL-3B-Instruct` or the
+#   gated MONAI VILA-M3 repos for the medical workflow) on a co-located
+#   GPU on the same node.
 #
 #   Layout: 1 node, 2 GPUs.
 #       GPU 0 -> SmolVLM2 student training (`train_stage2.py`)
@@ -32,32 +34,37 @@ DATA_DIR=${DATA_DIR:-$PROJECT_DIR/data/stage2}
 STAGE1_CKPT=${STAGE1_CKPT:-$PROJECT_DIR/checkpoints/stage1}
 OUT_DIR=${OUT_DIR:-$PROJECT_DIR/checkpoints/stage2_smoke}
 HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}
-TEACHER_MODEL=${TEACHER_MODEL:-Efficient-Large-Model/VILA-M3-7B}
+TEACHER_MODEL=${TEACHER_MODEL:-HuggingFaceTB/SmolVLM2-2.2B-Instruct}
 TEACHER_PORT=${TEACHER_PORT:-8000}
-CONDA_ENV=${CONDA_ENV:-vlm}
+# Two conda envs are used because vLLM and the trl trainer have incompatible
+# dependency requirements (e.g. transformers 4.x for vLLM 0.10.x vs. 5.x for
+# the trainer; CUDA 12 vs 13 wheel mismatches; etc.). Keeping them separate
+# is the only sane way to avoid an endless dependency-fight.
+SERVE_ENV=${SERVE_ENV:-vlm-serve-v1}      # vLLM teacher server
+TRAIN_ENV=${TRAIN_ENV:-vlm}               # trl student trainer
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Activate the conda env that has torch + transformers + trl[dev] + vllm
-#    installed. Auto-detects miniconda/anaconda in the usual locations.
-#    Override CONDA_ENV on the sbatch line for a different env name.
+# ── Source conda from the usual install locations so `conda activate` works.
 for _conda_root in "$HOME/miniconda3" "$HOME/anaconda3" "/opt/conda" "/opt/miniconda3" "/opt/anaconda3"; do
   if [ -f "$_conda_root/etc/profile.d/conda.sh" ]; then
     source "$_conda_root/etc/profile.d/conda.sh"
     break
   fi
 done
-conda activate "$CONDA_ENV"
 
 cd "$PROJECT_DIR"
 export HF_HOME
+mkdir -p logs
 
-echo "[stage2_smoke] node=$(hostname) conda_env=$CONDA_DEFAULT_ENV"
-python -c "import torch, trl; print(f'  torch={torch.__version__}  cuda={torch.cuda.is_available()}  trl={trl.__file__}')"
+echo "[stage2_smoke] node=$(hostname) serve_env=$SERVE_ENV train_env=$TRAIN_ENV"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
-# ── 1. Launch VILA-M3 teacher on GPU 1 (background) ─────────────────────────
+# ── 1. Launch teacher on GPU 1 (background) under the serving env ───────────
+#    The serving env is intentionally separate from the training env: vLLM
+#    pins older transformers/torch combos that the trainer can't tolerate.
 TEACHER_LOG="logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.teacher.log"
-mkdir -p "$(dirname "$TEACHER_LOG")"
+conda activate "$SERVE_ENV"
+python -c "import torch, vllm; print(f'  [serve] torch={torch.__version__} vllm={vllm.__version__}')"
 
 CUDA_VISIBLE_DEVICES=1 vllm serve "$TEACHER_MODEL" \
   --port "$TEACHER_PORT" \
@@ -72,7 +79,7 @@ trap 'kill $TEACHER_PID 2>/dev/null || true' EXIT
 echo "[stage2_smoke] waiting for teacher on http://localhost:${TEACHER_PORT} ..."
 for i in $(seq 1 90); do
   if curl -fs "http://localhost:${TEACHER_PORT}/v1/models" >/dev/null 2>&1; then
-    echo "[stage2_smoke] teacher ready after ${i}s"
+    echo "[stage2_smoke] teacher ready after $((i*5))s"
     break
   fi
   if ! kill -0 "$TEACHER_PID" 2>/dev/null; then
@@ -81,7 +88,11 @@ for i in $(seq 1 90); do
   sleep 5
 done
 
-# ── 3. Launch the student smoke training on GPU 0 ───────────────────────────
+# ── 3. Switch to the training env and launch the student on GPU 0 ───────────
+conda deactivate
+conda activate "$TRAIN_ENV"
+python -c "import torch, trl; print(f'  [train] torch={torch.__version__} trl={trl.__file__}')"
+
 CUDA_VISIBLE_DEVICES=0 python examples/scripts/distill_vlm/train_stage2.py \
   --stage1_ckpt "$STAGE1_CKPT" \
   --dataset_dir "$DATA_DIR" \

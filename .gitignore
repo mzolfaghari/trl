@@ -4,6 +4,8 @@
 .gitconfig
 *.bak
 *.log
+*.err
+*.out
 *~
 ~*
 _tmp*

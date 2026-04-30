@@ -1031,6 +1031,96 @@ class TestVLLMClientServerVLM(TrlTestCase):
         assert all(isinstance(tok, int) for tok in completion_ids[0])
         assert all(isinstance(tok, int) for tok in completion_ids[1])
 
+    def test_get_sequence_logprobs_with_token_ids_and_image(self):
+        """Score a batch of multimodal sequences and verify the teacher returns finite logprobs.
+
+        This is the multimodal counterpart to `test_generate_with_token_ids_and_image`: we score
+        existing sequences (no generation) under a VLM teacher, passing the raw images so the
+        teacher can resolve the image-token slots embedded in the prompts.
+        """
+        from PIL import Image
+
+        processor = AutoProcessor.from_pretrained(self.model_id)
+        image1 = Image.new("RGB", (64, 64), color="red")
+        image2 = Image.new("RGB", (64, 64), color="blue")
+        image3 = Image.new("RGB", (64, 64), color="green")
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image1},
+                        {"type": "image", "image": image2},
+                        {"type": "text", "text": "What are the differences between these two images?"},
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "They have different colors."}]},
+            ],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image3},
+                        {"type": "text", "text": "What is the color of this image?"},
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "Green."}]},
+            ],
+        ]
+        sequences = processor.apply_chat_template(conversation=messages, tokenize=True, add_generation_prompt=False)
+        # Use a 1-token completion budget so the request stays small. The exact split between
+        # prompt and completion doesn't matter for verifying the multimodal wiring.
+        prompt_lengths = [len(seq) - 1 for seq in sequences]
+        outputs = self.client.get_sequence_logprobs(
+            sequences=sequences,
+            prompt_lengths=prompt_lengths,
+            top_logprobs=5,
+            images=[[image1, image2], [image3]],
+            use_binary=False,
+        )
+
+        assert len(outputs["logprobs"]) == 2
+        assert len(outputs["logprob_token_ids"]) == 2
+        for per_seq_lps in outputs["logprobs"]:
+            for per_token_lps in per_seq_lps:
+                assert all(isinstance(lp, float) for lp in per_token_lps)
+
+    def test_get_sequence_logprobs_with_token_ids_mixed_images(self):
+        """A batch where one sequence has images and the other is text-only.
+
+        Mirrors `test_generate_with_token_ids_mixed_images` — verifies that `images=[[img], None]`
+        correctly routes the multimodal payload only to the samples that need it.
+        """
+        from PIL import Image
+
+        processor = AutoProcessor.from_pretrained(self.model_id)
+        image = Image.new("RGB", (64, 64), color="red")
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": image}, {"type": "text", "text": "Describe this image."}],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "A red square."}]},
+            ],
+            [
+                {"role": "user", "content": [{"type": "text", "text": "What is 1+1?"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "2."}]},
+            ],
+        ]
+        sequences = processor.apply_chat_template(conversation=messages, tokenize=True, add_generation_prompt=False)
+        prompt_lengths = [len(seq) - 1 for seq in sequences]
+        outputs = self.client.get_sequence_logprobs(
+            sequences=sequences,
+            prompt_lengths=prompt_lengths,
+            top_logprobs=5,
+            images=[[image], None],
+            use_binary=False,
+        )
+
+        assert len(outputs["logprobs"]) == 2
+        assert len(outputs["logprob_token_ids"]) == 2
+
     @classmethod
     def teardown_class(cls):
         kill_process(cls.server_process)

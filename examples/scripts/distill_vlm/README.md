@@ -27,7 +27,8 @@ teacher). To retarget another domain (legal, scientific, …) you only need to s
 
 | Component | Path |
 | --- | --- |
-| Student model | `HuggingFaceTB/SmolVLM2-500M-Instruct` |
+| Student model (default) | `HuggingFaceTB/SmolVLM2-500M-Video-Instruct` (image+video; the only 500M SmolVLM2 image-instruct on the Hub) |
+| Student model (recommended for the larger ISIC run) | `HuggingFaceTB/SmolVLM2-2.2B-Instruct` |
 | Stage 1 teacher (offline, medical example) | `microsoft/llava-med-v1.5-mistral-7b` |
 | Stage 2 teacher (vLLM server, medical example) | `Efficient-Large-Model/VILA-M3-7B` (verify on the Hub) |
 | Trainer modifications | `trl/experimental/distillation_vlm/distillation_{config,trainer}.py` |
@@ -94,12 +95,21 @@ Per-sample inverse-frequency `class_weight` values are computed inline.
 
 ## 5. Start the teacher (separate terminal, separate GPU)
 
+Use `trl vllm-serve` (not the upstream `vllm serve`) so the custom `/get_sequence_logprobs/`
+endpoint that `DistillationTrainer` requires is exposed:
+
 ```bash
-CUDA_VISIBLE_DEVICES=1 vllm serve Efficient-Large-Model/VILA-M3-7B \
+CUDA_VISIBLE_DEVICES=1 trl vllm-serve \
+  --model Efficient-Large-Model/VILA-M3-7B \
   --port 8000 \
   --dtype bfloat16 \
-  --gpu-memory-utilization 0.9
+  --gpu_memory_utilization 0.9
 ```
+
+Multimodal teachers are supported: `VLMDistillationCollator` retains the raw PIL images
+per-sample and the trainer forwards them on the `images` field of the request, which the
+server attaches as `multi_modal_data` on each vLLM prompt. Text-only teachers continue to work
+unchanged — when `images` is absent the request is byte-identical to the pre-VLM wire format.
 
 > Verify the exact model ID on https://huggingface.co before running. The placeholder
 > constant `VILA_M3_MODEL_ID` in `train_stage2.py` should be updated if the canonical ID
@@ -156,6 +166,21 @@ These cover the `DistillationConfig` fields, the `_DistillationCollator` VLM
 passthrough, the `processing_class` alias, the RDist hook registration, the
 freezing logic for both stages, and the class-weight computation. If any of
 these fail, fix locally before submitting a job.
+
+### Synthetic smoke-test datasets (skip LLaVA-Med + the labels CSV)
+
+The bundled builders need a real teacher (Stage 1) or a labelled CSV +
+matching image folder (Stage 2). When you only want to verify the trainers
+end-to-end, generate tiny random-image fixtures instead:
+
+```bash
+python examples/scripts/distill_vlm/data/build_synthetic_datasets.py \
+  --output_dir /tmp/sanity
+```
+
+Writes 50-row HuggingFace `Dataset`s to `/tmp/sanity/stage1` and
+`/tmp/sanity/stage2` in the exact schema consumed by `train_stage1.py` and
+`train_stage2.py`. Use `--stage 1` or `--stage 2` to build only one.
 
 ### Stage 1 smoke test — single GPU, ~5–15 min
 

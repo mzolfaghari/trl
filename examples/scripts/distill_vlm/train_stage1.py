@@ -32,13 +32,19 @@ import argparse
 import logging
 
 import torch
-from datasets import load_from_disk
+from datasets import Image, Sequence, Value, load_from_disk
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from trl import SFTConfig, SFTTrainer
 
 
-SMOLVLM_MODEL_ID = "HuggingFaceTB/SmolVLM2-500M-Instruct"
+# NOTE: at the 500M scale, the only SmolVLM2 image-instruct checkpoint published on
+# the Hub is the "Video-Instruct" variant. Despite the name, the model accepts plain
+# images (Idefics3 architecture, same vision encoder + LM as the rest of the family),
+# and this is what every previous Stage 1 run in this repo has trained against.
+# For the higher-quality SmolVLM2 image-flagship, override with
+# `--model_name_or_path HuggingFaceTB/SmolVLM2-2.2B-Instruct`.
+SMOLVLM_MODEL_ID = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 
 logger = logging.getLogger("train_stage1")
 
@@ -61,7 +67,52 @@ def _parse_args() -> argparse.Namespace:
         "--model_name_or_path",
         type=str,
         default=SMOLVLM_MODEL_ID,
-        help="Student model ID. Defaults to the SmolVLM2 500M instruct checkpoint.",
+        help=(
+            "Student model ID. Defaults to SmolVLM2-500M-Video-Instruct (the only "
+            "500M SmolVLM2 image-instruct checkpoint on the Hub). For better quality "
+            "pass `HuggingFaceTB/SmolVLM2-2.2B-Instruct`."
+        ),
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-3,
+        help=(
+            "AdamW learning rate. 1e-3 is the standard choice for connector-only "
+            "pre-training (LLaVA, LLaVA-1.5, Idefics2 perceiver, SmolVLM connector "
+            "all use 1e-3; LLaVA-Med uses 2e-3). The connector is small, randomly "
+            "initialised w.r.t. the target domain, and decoupled from the frozen "
+            "backbone — so it tolerates an aggressive LR without destabilising "
+            "anything else. To handle bigger datasets, lower --num_train_epochs "
+            "rather than this LR."
+        ),
+    )
+    parser.add_argument(
+        "--num_train_epochs",
+        type=float,
+        default=3.0,
+        help=(
+            "Number of training epochs. Connector alignment converges fast: LLaVA "
+            "pretrains its projector for a single epoch on 558k pairs. With ~600 "
+            "HAM10000 rows 3 epochs is fine; with ~30k ISIC rows use 1 epoch."
+        ),
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Hard cap on optimizer steps (overrides --num_train_epochs). Set for time-budgeted runs.",
+    )
+    parser.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        default=4,
+        help="Per-device batch size. Effective batch = this × gradient_accumulation_steps × num_devices.",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=4,
     )
     parser.add_argument(
         "--smoke_test",
@@ -90,9 +141,7 @@ def _freeze_all_except_connector(model: torch.nn.Module) -> tuple[int, int]:
 
 
 def _print_trainable_summary(model: torch.nn.Module, trainable: int, total: int) -> None:
-    trainable_modules = sorted(
-        {name.rsplit(".", 1)[0] for name, p in model.named_parameters() if p.requires_grad}
-    )
+    trainable_modules = sorted({name.rsplit(".", 1)[0] for name, p in model.named_parameters() if p.requires_grad})
     logger.info("Trainable modules (Stage 1):")
     for name in trainable_modules:
         logger.info("  - %s", name)
@@ -114,6 +163,14 @@ def main() -> None:
     _print_trainable_summary(model, trainable, total)
 
     train_dataset = load_from_disk(args.dataset_dir)
+    # `build_isic_stage1.py` stores `images` as absolute path strings (see the long
+    # comment in that file for why). Casting to `Sequence(Image())` is a free metadata
+    # flip that turns each string into a lazily-decoded PIL.Image on `__getitem__`,
+    # which is what the SFT collator + processor expect. For datasets that already
+    # use `Sequence(Image())` (e.g. `build_ham10000_stage1.py`), this is a no-op.
+    images_feat = train_dataset.features.get("images")
+    if isinstance(images_feat, Sequence) and isinstance(images_feat.feature, Value):
+        train_dataset = train_dataset.cast_column("images", Sequence(Image()))
     if args.smoke_test:
         n = min(50, len(train_dataset))
         train_dataset = train_dataset.select(range(n))
@@ -121,10 +178,10 @@ def main() -> None:
 
     sft_config_kwargs = dict(
         output_dir=args.output_dir,
-        learning_rate=1e-3,
-        num_train_epochs=3,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
+        learning_rate=args.learning_rate,
+        num_train_epochs=args.num_train_epochs,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         bf16=True,
         max_length=None,
         dataset_kwargs={"skip_prepare_dataset": True},
@@ -135,6 +192,8 @@ def main() -> None:
         save_strategy="epoch" if not args.smoke_test else "no",
         report_to="none",
     )
+    if args.max_steps is not None:
+        sft_config_kwargs["max_steps"] = args.max_steps
     if args.smoke_test:
         sft_config_kwargs["max_steps"] = 2
         sft_config_kwargs["num_train_epochs"] = 1

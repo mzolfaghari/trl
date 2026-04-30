@@ -147,6 +147,10 @@ class VLMDistillationCollator:
             "prompts": prompt_ids,
             "prompt_attention_mask": prompt["attention_mask"][0],
             "pixel_values": full["pixel_values"][0],
+            # Retain the raw PIL images so the trainer can forward them to a remote multimodal
+            # teacher. The teacher runs its own processor, so it needs the original images rather
+            # than the student-preprocessed `pixel_values`.
+            "raw_images": list(images),
         }
         if "pixel_attention_mask" in full:
             item["pixel_attention_mask"] = full["pixel_attention_mask"][0]
@@ -202,9 +206,12 @@ class VLMDistillationCollator:
                 batch["pixel_attention_mask"] = torch.stack(padded)
 
         if "class_weight" in examples[0]:
-            batch["class_weight"] = torch.tensor(
-                [float(ex["class_weight"]) for ex in examples], dtype=torch.float32
-            )
+            batch["class_weight"] = torch.tensor([float(ex["class_weight"]) for ex in examples], dtype=torch.float32)
+
+        # Per-sample list of PIL images. Carried through as a Python list (not a tensor) because
+        # the remote teacher's processor expects raw images, not the student-preprocessed pixels.
+        # Trainer code that talks to a multimodal teacher reads `inputs["raw_images"]`.
+        batch["raw_images"] = [it["raw_images"] for it in items]
 
         return batch
 

@@ -44,6 +44,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from contextlib import nullcontext
 
@@ -334,6 +335,11 @@ class TestCombinedLossAndLogging(TrlTestCase):
             max_steps=1,
             logging_steps=1,
             report_to="none",
+            # Pin precision to fp32 so this metric-logging test is independent of
+            # GPU availability / bf16 detection. The values asserted below are
+            # logging-only and don't depend on training dtype.
+            bf16=False,
+            fp16=False,
             beta=0.0,
             lmbda=0.0,
             use_rdist=use_rdist,
@@ -385,7 +391,10 @@ class TestCombinedLossAndLogging(TrlTestCase):
         assert rdist == pytest.approx(0.0, abs=1e-6)
         # Sanity: the other components are finite and non-negative.
         assert sft >= 0
-        assert kl >= 0
+        # Student and teacher start from the same checkpoint, so KL is ~0 modulo
+        # fp32 reduction noise; just guard against gross negative values / NaNs.
+        assert math.isfinite(kl)
+        assert kl == pytest.approx(0.0, abs=1e-4)
 
 
 class TestRDistMath(TrlTestCase):
