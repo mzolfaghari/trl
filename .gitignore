@@ -135,7 +135,7 @@ tools/fastai
 
 # link checker
 checklink/cookies.txt
-# path to logs
+
 logs/*
 sanity_data/*
 examples*
