@@ -1,0 +1,63 @@
+# Smoke test: 1000 records of tier1, short intervals, quick to sanity-check
+# the data pipeline + model wiring before launching a real job.
+#
+# Launch on a single node × 1 GPU:
+#   sbatch --nodes=1 --gpus-per-node=1 \
+#       slurm/sft_smolvlm2_nemotron.slurm configs/sft_smolvlm2/nemotron_smoke.yaml
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model_name_or_path: HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+dtype: bfloat16
+attn_implementation: sdpa
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+train_jsonl: /home/pengfei/workspace/qvac-edge-vlm/nanoVLM/Nemotron_finetune/data/nemotron_tier1_train.jsonl
+nemotron_root: /home/pengfei/datasets/Nemotron-Image-Training-v3
+val_frac: 0.05
+smoke_limit: 1000
+
+# ── Per-group learning rates ─────────────────────────────────────────────────
+lr_connector: 1.0e-4
+lr_text:      5.0e-5
+lr_vision:    1.0e-5
+
+# ── Training ─────────────────────────────────────────────────────────────────
+output_dir: checkpoints/smolvlm2-500m-nemotron-smoke
+num_train_epochs: 1
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 2
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+
+learning_rate: 5.0e-5
+adam_beta1: 0.9
+adam_beta2: 0.95
+weight_decay: 0.01
+max_grad_norm: 1.0
+warmup_ratio: 0.03
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+
+# ── Sequence / dataloader ────────────────────────────────────────────────────
+# NOTE: max_length is forced to None inside the script (VLM truncation breaks
+# the image-token count invariant — see sft_vlm.py for the same pattern).
+dataloader_num_workers: 2
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 2
+dataloader_pin_memory: true
+seed: 0
+
+# ── Logging / eval / checkpoints (short intervals so we see signal fast) ─────
+logging_steps: 5
+logging_first_step: true
+eval_strategy: steps
+eval_steps: 50
+save_strategy: steps
+save_steps: 100
+save_total_limit: 2
+load_best_model_at_end: true
+metric_for_best_model: eval_loss
+greater_is_better: false
+report_to: "none"
+bf16: true
